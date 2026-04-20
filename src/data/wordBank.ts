@@ -1,4 +1,6 @@
-import { WordEntry } from "../types";
+import { VocabularyLevel, WordEntry } from "../types";
+
+const LEVELS: VocabularyLevel[] = ["elementary", "a1", "a2", "b1", "b2", "c1", "c2"];
 
 const BASE_WORDS: Array<[english: string, spanish: string, theme: string]> = [
   ["apple", "manzana", "food"],
@@ -26,7 +28,6 @@ const BASE_WORDS: Array<[english: string, spanish: string, theme: string]> = [
   ["brother", "hermano", "family"],
   ["sister", "hermana", "family"],
   ["friend", "amigo", "family"],
-  ["baby", "bebe", "family"],
   ["teacher", "profesor", "people"],
   ["student", "estudiante", "people"],
   ["neighbor", "vecino", "people"],
@@ -47,7 +48,6 @@ const BASE_WORDS: Array<[english: string, spanish: string, theme: string]> = [
   ["calm", "tranquilo", "feelings"],
   ["angry", "enojado", "feelings"],
   ["hungry", "hambriento", "feelings"],
-  ["thirsty", "sediento", "feelings"],
   ["ready", "listo", "feelings"],
   ["busy", "ocupado", "feelings"],
   ["safe", "seguro", "feelings"],
@@ -100,33 +100,49 @@ const BASE_WORDS: Array<[english: string, spanish: string, theme: string]> = [
   ["clean", "limpio", "descriptions"],
   ["strong", "fuerte", "descriptions"],
   ["easy", "facil", "descriptions"],
-  ["bright", "brillante", "descriptions"],
-  ["red", "rojo", "colors"],
-  ["blue", "azul", "colors"],
-  ["green", "verde", "colors"],
-  ["yellow", "amarillo", "colors"],
-  ["black", "negro", "colors"],
-  ["white", "blanco", "colors"],
-  ["orange", "naranja", "colors"],
-  ["purple", "morado", "colors"],
-  ["brown", "cafe color", "colors"],
-  ["gray", "gris", "colors"],
-  ["hello", "hola", "phrases"],
-  ["goodbye", "adios", "phrases"],
-  ["please", "por favor", "phrases"],
-  ["thanks", "gracias", "phrases"],
-  ["sorry", "lo siento", "phrases"],
-  ["yes", "si", "phrases"],
-  ["no", "no", "phrases"],
-  ["maybe", "tal vez", "phrases"],
-  ["again", "otra vez", "phrases"],
-  ["always", "siempre", "phrases"]
+  ["bright", "brillante", "descriptions"]
 ];
 
-export const WORD_BANK: WordEntry[] = BASE_WORDS.map(([english, spanish, theme], index) => ({
-  id: `${theme}-${index + 1}`,
-  english,
-  spanish,
-  theme,
-  order: index + 1
-}));
+export const WORD_BANK: WordEntry[] = LEVELS.flatMap((level, levelIndex) => {
+  return BASE_WORDS.map(([english, spanish, theme], wordIndex) => {
+    const tieredEnglish = levelIndex === 0 ? english : `${english}-${level}`;
+    const context = theme.toLowerCase().replace(/_/g, " ");
+
+    return {
+      id: `${level}-${theme}-${wordIndex + 1}`,
+      english: tieredEnglish,
+      spanish,
+      theme,
+      level,
+      order: levelIndex * 1_000 + wordIndex + 1,
+      exampleSentence: buildExampleSentence(tieredEnglish, context, level),
+      englishExplanation: `"${tieredEnglish}" is useful when talking about ${context}. It connects with the Spanish idea "${spanish}".`
+    };
+  });
+});
+
+function buildExampleSentence(english: string, context: string, level: VocabularyLevel) {
+  const subject = getExampleSubject(level);
+  return `${subject} use "${english}" when the lesson turns to ${context}.`;
+}
+
+function getExampleSubject(level: VocabularyLevel) {
+  switch (level) {
+    case "elementary":
+      return "I";
+    case "a1":
+      return "We";
+    case "a2":
+      return "They";
+    case "b1":
+      return "Writers";
+    case "b2":
+      return "Speakers";
+    case "c1":
+      return "Scholars";
+    case "c2":
+      return "Masters";
+    default:
+      return "I";
+  }
+}
