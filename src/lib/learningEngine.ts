@@ -4,26 +4,140 @@ import {
   LearningBatch,
   SessionCard,
   SessionCardSource,
+  VocabularyLevel,
   WordEntry,
   WordProgress
 } from "../types";
 import { addDays, compareDateKeys, diffInDays } from "./date";
+import { createEmptyEquipment, gainXp, getEquippedStats, getXpAward, rollRewardItem, XP_PER_LEVEL } from "./rpg";
 
-export const NEW_BATCH_SIZE = 10;
+export const DEFAULT_NEW_BATCH_SIZE = 5;
+export const MIN_NEW_BATCH_SIZE = 5;
+export const MAX_NEW_BATCH_SIZE = 5;
 export const INITIAL_HITS_REQUIRED = 3;
 export const REVIEW_HITS_REQUIRED = 1;
+export const LEARN_XP_REWARD = 3;
+export const DAILY_REVIEW_XP_REWARD = 7;
+export const DEFAULT_VOCABULARY_LEVEL: VocabularyLevel = "elementary";
+export const VOCABULARY_LEVELS: VocabularyLevel[] = ["elementary", "a1", "a2", "b1", "b2", "c1", "c2"];
+
+export const VOCABULARY_LEVEL_META: Record<
+  VocabularyLevel,
+  { title: string; cefr: string; contentLabel: string }
+> = {
+  elementary: { title: "Aspirante", cefr: "A0", contentLabel: "Word + traduccion" },
+  a1: { title: "Aprendiz", cefr: "A1", contentLabel: "Traduccion + example" },
+  a2: { title: "Adepto", cefr: "A2", contentLabel: "Traduccion + example + explain" },
+  b1: { title: "Guardia", cefr: "B1", contentLabel: "Example + explain + traduccion oculta" },
+  b2: { title: "Maestro", cefr: "B2", contentLabel: "Example + explain + traduccion oculta" },
+  c1: { title: "Gran Maestro", cefr: "C1", contentLabel: "Example + explain + traduccion oculta" },
+  c2: { title: "Sabio", cefr: "C2", contentLabel: "Example + explain + traduccion oculta" }
+};
+
+export const PROFILE_TITLES = [
+  "Aspirante",
+  "Aprendiz",
+  "Iniciado",
+  "Adepto",
+  "Guardia",
+  "Maestro",
+  "Gran Maestro",
+  "Sabio"
+] as const;
+
+const CARD_SOURCE_PRIORITY: Record<SessionCardSource, number> = {
+  new: 0,
+  review_same_day: 1,
+  review_day: 2,
+  review_week: 3,
+  review_month: 4,
+  bonus: 5
+};
+
+export function clampDailyNewWordsCount() {
+  return DEFAULT_NEW_BATCH_SIZE;
+}
+
+export function clampVocabularyLevel(level: string | undefined): VocabularyLevel {
+  if (level && VOCABULARY_LEVELS.includes(level as VocabularyLevel)) {
+    return level as VocabularyLevel;
+  }
+
+  return DEFAULT_VOCABULARY_LEVEL;
+}
+
+export function isWordAllowedForLevel(wordLevel: VocabularyLevel, selectedLevel: VocabularyLevel) {
+  return VOCABULARY_LEVELS.indexOf(wordLevel) <= VOCABULARY_LEVELS.indexOf(selectedLevel);
+}
+
+export function getVocabularyModuleProgress(state: AppState, words: WordEntry[]) {
+  return VOCABULARY_LEVELS.map((level, index) => {
+    const moduleWords = words.filter((word) => word.level === level);
+    const learnedCount = moduleWords.filter((word) => state.progress[word.id]?.stage === "learned").length;
+    const completionRatio = moduleWords.length > 0 ? learnedCount / moduleWords.length : 0;
+
+    return {
+      level,
+      learnedCount,
+      totalCount: moduleWords.length,
+      completionRatio,
+      isUnlocked: completionRatio >= 0.7,
+      rank: index + 1,
+      title: VOCABULARY_LEVEL_META[level].title
+    };
+  });
+}
+
+export function getVocabularySkillRank(state: AppState, words: WordEntry[]) {
+  return getVocabularyModuleProgress(state, words).reduce((highestRank, moduleProgress) => {
+    return moduleProgress.isUnlocked ? Math.max(highestRank, moduleProgress.rank) : highestRank;
+  }, 0);
+}
+
+export function getProfileTitleFromSkillRanks(skillRanks: number[]) {
+  if (skillRanks.length === 0) {
+    return PROFILE_TITLES[0];
+  }
+
+  const averageRank = skillRanks.reduce((sum, rank) => sum + rank, 0) / skillRanks.length;
+  const roundedRank = Math.min(PROFILE_TITLES.length - 1, Math.max(0, Math.round(averageRank)));
+  return PROFILE_TITLES[roundedRank];
+}
+
+export function getVocabularyMasteryTitle(state: AppState, words: WordEntry[]) {
+  return PROFILE_TITLES[getVocabularySkillRank(state, words)];
+}
+
+export function getHighestUnlockedLevel(state: AppState, words: WordEntry[]): VocabularyLevel {
+  const unlockedModule = [...getVocabularyModuleProgress(state, words)]
+    .reverse()
+    .find((module) => module.isUnlocked);
+
+  return unlockedModule?.level ?? DEFAULT_VOCABULARY_LEVEL;
+}
 
 export function createInitialAppState(): AppState {
   return {
     settings: {
+      displayName: "Traveler",
       preferredReminderTime: "19:30",
       notificationsEnabled: false,
       locale: "es-CR",
-      notificationPermission: "default"
+      notificationPermission: "default",
+      dailyNewWordsCount: DEFAULT_NEW_BATCH_SIZE,
+      vocabularyLevel: DEFAULT_VOCABULARY_LEVEL
     },
     batches: [],
     progress: {},
-    dailySessions: {}
+    dailySessions: {},
+    playerProgress: {
+      xp: 0,
+      level: 1,
+      xpToNextLevel: XP_PER_LEVEL,
+      claimedReviewRewardDates: []
+    },
+    inventory: [],
+    equipment: createEmptyEquipment()
   };
 }
 
@@ -57,8 +171,7 @@ export function previewSessionForDate(
   words: WordEntry[],
   dateKey: string
 ): DailySession {
-  const previewState = ensureSessionForDate(state, words, dateKey);
-  return previewState.dailySessions[dateKey];
+  return ensureSessionForDate(state, words, dateKey).dailySessions[dateKey];
 }
 
 export function beginSession(state: AppState, dateKey: string, nowIso: string): AppState {
@@ -75,8 +188,9 @@ export function beginSession(state: AppState, dateKey: string, nowIso: string): 
 
 export function recordAttempt(
   state: AppState,
+  words: WordEntry[],
   dateKey: string,
-  wordId: string,
+  cardId: string,
   success: boolean,
   nowIso: string
 ): AppState {
@@ -85,7 +199,7 @@ export function recordAttempt(
     return state;
   }
 
-  const activeCardIndex = session.cards.findIndex((card) => card.wordId === wordId && !card.isComplete);
+  const activeCardIndex = session.cards.findIndex((card) => card.id === cardId && !card.isComplete);
   if (activeCardIndex === -1) {
     return state;
   }
@@ -93,7 +207,7 @@ export function recordAttempt(
   const nextState = structuredClone(state);
   const nextSession = nextState.dailySessions[dateKey];
   const nextCard = nextSession.cards[activeCardIndex];
-  const nextProgress = nextState.progress[wordId];
+  const nextProgress = nextState.progress[nextCard.wordId];
   const batchCreatedDate = nextState.batches.find((batch) => batch.id === nextProgress.batchId)?.createdDate;
 
   touchSessionClock(nextSession, nowIso);
@@ -101,7 +215,7 @@ export function recordAttempt(
   nextProgress.lastResult = success ? "success" : "failure";
 
   if (success) {
-    applySuccess(nextCard, nextProgress, batchCreatedDate ?? dateKey, dateKey);
+    applySuccess(nextState, nextSession, nextCard, nextProgress, batchCreatedDate ?? dateKey, dateKey, words);
   } else {
     applyFailure(nextCard, nextProgress, dateKey);
   }
@@ -112,6 +226,7 @@ export function recordAttempt(
   }
 
   refreshBatchStatuses(nextState);
+  maybeGrantDailyReviewReward(nextState, words, dateKey);
 
   if (nextSession.cards.length > 0 && nextSession.cards.every((card) => card.isComplete)) {
     nextSession.completedAt = nowIso;
@@ -127,24 +242,56 @@ export function getSessionMetrics(session?: DailySession) {
       total: 0,
       completed: 0,
       pending: 0,
-      newCount: 0,
+      learnTotal: 0,
+      learnPending: 0,
+      reviewTotal: 0,
+      reviewPending: 0,
+      sameDayCount: 0,
       reviewCount: 0,
       bonusCount: 0
     };
   }
 
+  const learnCards = getLearnCards(session);
+  const reviewCards = getReviewCards(session);
   const completed = session.cards.filter((card) => card.isComplete).length;
-  const newCount = session.cards.filter((card) => card.source === "new").length;
-  const bonusCount = session.cards.filter((card) => card.source === "bonus").length;
 
   return {
     total: session.cards.length,
     completed,
     pending: session.cards.length - completed,
-    newCount,
-    reviewCount: session.cards.length - newCount,
-    bonusCount
+    learnTotal: learnCards.length,
+    learnPending: learnCards.filter((card) => !card.isComplete).length,
+    reviewTotal: reviewCards.length,
+    reviewPending: reviewCards.filter((card) => !card.isComplete).length,
+    sameDayCount: reviewCards.filter((card) => card.source === "review_same_day").length,
+    reviewCount: reviewCards.filter((card) => card.source !== "bonus").length,
+    bonusCount: reviewCards.filter((card) => card.source === "bonus").length
   };
+}
+
+export function getLearnCards(session?: DailySession) {
+  if (!session) {
+    return [];
+  }
+
+  return session.cards.filter((card) => card.source === "new");
+}
+
+export function getReviewCards(session?: DailySession) {
+  if (!session) {
+    return [];
+  }
+
+  return session.cards.filter((card) => card.source !== "new");
+}
+
+export function getPendingLearnCards(session?: DailySession) {
+  return getLearnCards(session).filter((card) => !card.isComplete);
+}
+
+export function getPendingReviewCards(session?: DailySession) {
+  return getReviewCards(session).filter((card) => !card.isComplete);
 }
 
 export function getStreakSummary(dailySessions: Record<string, DailySession>) {
@@ -192,25 +339,21 @@ export function isSessionPending(session?: DailySession): boolean {
   return Boolean(session?.cards.some((card) => !card.isComplete));
 }
 
-export function getSessionNewWords(
-  session: DailySession | undefined,
-  words: WordEntry[]
-): WordEntry[] {
+export function getSessionNewWords(session: DailySession | undefined, words: WordEntry[]): WordEntry[] {
   if (!session) {
     return [];
   }
 
   const wordLookup = createWordLookup(words);
 
-  return session.cards
-    .filter((card) => card.source === "new")
+  return getLearnCards(session)
     .map((card) => wordLookup[card.wordId])
     .filter((word): word is WordEntry => Boolean(word));
 }
 
 export function getNextDueDate(state: AppState): string | null {
   const pendingDates = Object.values(state.progress)
-    .flatMap((progress) => [progress.nextDueDate, progress.bonusDueDate])
+    .flatMap((progress) => [progress.nextDueDate, progress.bonusDueDate, progress.sameDayReviewDueDate])
     .filter((date): date is string => Boolean(date))
     .sort((left, right) => compareDateKeys(left, right));
 
@@ -241,7 +384,11 @@ function createWordLookup(words: WordEntry[]) {
 
 function createNextBatch(state: AppState, words: WordEntry[], dateKey: string) {
   const usedWordIds = new Set(state.batches.flatMap((batch) => batch.wordIds));
-  const nextWords = words.filter((word) => !usedWordIds.has(word.id)).slice(0, NEW_BATCH_SIZE);
+  const batchSize = clampDailyNewWordsCount();
+  const selectedLevel = clampVocabularyLevel(state.settings.vocabularyLevel);
+  const nextWords = words
+    .filter((word) => !usedWordIds.has(word.id) && isWordAllowedForLevel(word.level, selectedLevel))
+    .slice(0, batchSize);
 
   if (nextWords.length === 0) {
     return;
@@ -266,13 +413,15 @@ function createNextBatch(state: AppState, words: WordEntry[], dateKey: string) {
       currentHits: 0,
       lastResult: null,
       nextDueDate: null,
-      bonusDueDate: null
+      bonusDueDate: null,
+      sameDayReviewDueDate: null,
+      learnXpAwarded: false
     };
   });
 }
 
 function buildCardsForDate(state: AppState, dateKey: string): SessionCard[] {
-  const cardsByWordId = new Map<string, SessionCard>();
+  const cards: SessionCard[] = [];
 
   state.batches
     .slice()
@@ -280,49 +429,56 @@ function buildCardsForDate(state: AppState, dateKey: string): SessionCard[] {
     .forEach((batch) => {
       batch.wordIds.forEach((wordId) => {
         const progress = state.progress[wordId];
-        if (!progress || progress.stage === "learned" || cardsByWordId.has(wordId)) {
+        if (!progress || progress.stage === "learned") {
           return;
         }
 
         if (progress.stage === "new") {
-          cardsByWordId.set(wordId, {
-            wordId,
-            source: "new",
-            hitsNeededToday: progress.requiredHits,
-            hitsDoneToday: progress.currentHits,
-            isComplete: false,
-            failures: 0
-          });
+          cards.push(createCard(dateKey, wordId, "new", progress.requiredHits, progress.currentHits));
           return;
+        }
+
+        if (progress.sameDayReviewDueDate && compareDateKeys(progress.sameDayReviewDueDate, dateKey) <= 0) {
+          cards.push(createCard(dateKey, wordId, "review_same_day", REVIEW_HITS_REQUIRED, 0));
         }
 
         const dueSource = getDueSource(progress, dateKey);
         if (dueSource) {
-          cardsByWordId.set(wordId, {
-            wordId,
-            source: dueSource,
-            hitsNeededToday: REVIEW_HITS_REQUIRED,
-            hitsDoneToday: 0,
-            isComplete: false,
-            failures: 0
-          });
-          return;
+          cards.push(createCard(dateKey, wordId, dueSource, REVIEW_HITS_REQUIRED, 0));
         }
 
         if (progress.bonusDueDate && compareDateKeys(progress.bonusDueDate, dateKey) <= 0) {
-          cardsByWordId.set(wordId, {
-            wordId,
-            source: "bonus",
-            hitsNeededToday: REVIEW_HITS_REQUIRED,
-            hitsDoneToday: 0,
-            isComplete: false,
-            failures: 0
-          });
+          cards.push(createCard(dateKey, wordId, "bonus", REVIEW_HITS_REQUIRED, 0));
         }
       });
     });
 
-  return Array.from(cardsByWordId.values());
+  return cards.sort((left, right) => {
+    const sourceDelta = CARD_SOURCE_PRIORITY[left.source] - CARD_SOURCE_PRIORITY[right.source];
+    if (sourceDelta !== 0) {
+      return sourceDelta;
+    }
+
+    return left.wordId.localeCompare(right.wordId);
+  });
+}
+
+function createCard(
+  dateKey: string,
+  wordId: string,
+  source: SessionCardSource,
+  hitsNeededToday: number,
+  hitsDoneToday: number
+): SessionCard {
+  return {
+    id: `${dateKey}:${source}:${wordId}`,
+    wordId,
+    source,
+    hitsNeededToday,
+    hitsDoneToday,
+    isComplete: hitsDoneToday >= hitsNeededToday,
+    failures: 0
+  };
 }
 
 function getDueSource(progress: WordProgress, dateKey: string): SessionCardSource | null {
@@ -367,10 +523,13 @@ function touchSessionClock(session: DailySession, nowIso: string) {
 }
 
 function applySuccess(
+  state: AppState,
+  session: DailySession,
   card: SessionCard,
   progress: WordProgress,
   batchCreatedDate: string,
-  currentDateKey: string
+  currentDateKey: string,
+  words: WordEntry[]
 ) {
   if (card.source === "new") {
     progress.currentHits = Math.min(progress.requiredHits, progress.currentHits + 1);
@@ -378,7 +537,14 @@ function applySuccess(
 
     if (progress.currentHits >= progress.requiredHits) {
       card.isComplete = true;
-      promoteFromNew(progress, batchCreatedDate);
+
+      if (!progress.learnXpAwarded) {
+        progress.learnXpAwarded = true;
+        awardXp(state, LEARN_XP_REWARD);
+      }
+
+      promoteFromNew(progress, batchCreatedDate, currentDateKey);
+      addSameDayReviewCard(session, currentDateKey, card.wordId);
     }
 
     return;
@@ -392,11 +558,19 @@ function applySuccess(
     return;
   }
 
-  if (progress.bonusDueDate && compareDateKeys(progress.bonusDueDate, currentDateKey) <= 0) {
-    progress.bonusDueDate = null;
+  if (card.source === "review_same_day") {
+    progress.sameDayReviewDueDate = null;
+    return;
   }
 
   promoteReview(progress, card.source, batchCreatedDate);
+
+  if (progress.stage === "learned") {
+    const masteryLevel = getHighestUnlockedLevel(state, words);
+    if (masteryLevel === "c2") {
+      progress.bonusDueDate = null;
+    }
+  }
 }
 
 function applyFailure(card: SessionCard, progress: WordProgress, dateKey: string) {
@@ -407,16 +581,17 @@ function applyFailure(card: SessionCard, progress: WordProgress, dateKey: string
   }
 }
 
-function promoteFromNew(progress: WordProgress, batchCreatedDate: string) {
+function promoteFromNew(progress: WordProgress, batchCreatedDate: string, currentDateKey: string) {
   progress.stage = "day1";
   progress.requiredHits = REVIEW_HITS_REQUIRED;
   progress.currentHits = 0;
   progress.nextDueDate = addDays(batchCreatedDate, 1);
+  progress.sameDayReviewDueDate = currentDateKey;
 }
 
 function promoteReview(
   progress: WordProgress,
-  source: Exclude<SessionCardSource, "new" | "bonus">,
+  source: Exclude<SessionCardSource, "new" | "bonus" | "review_same_day">,
   batchCreatedDate: string
 ) {
   progress.requiredHits = REVIEW_HITS_REQUIRED;
@@ -436,6 +611,41 @@ function promoteReview(
 
   progress.stage = "learned";
   progress.nextDueDate = null;
+}
+
+function addSameDayReviewCard(session: DailySession, dateKey: string, wordId: string) {
+  const sameDayCardId = `${dateKey}:review_same_day:${wordId}`;
+  if (session.cards.some((card) => card.id === sameDayCardId)) {
+    return;
+  }
+
+  session.cards.push(createCard(dateKey, wordId, "review_same_day", REVIEW_HITS_REQUIRED, 0));
+}
+
+function maybeGrantDailyReviewReward(state: AppState, words: WordEntry[], dateKey: string) {
+  const reviewCards = getReviewCards(state.dailySessions[dateKey]);
+  if (reviewCards.length === 0 || reviewCards.some((card) => !card.isComplete)) {
+    return;
+  }
+
+  if (state.playerProgress.claimedReviewRewardDates.includes(dateKey)) {
+    return;
+  }
+
+  const equippedStats = getEquippedStats(state);
+  awardXp(state, DAILY_REVIEW_XP_REWARD);
+
+  const rewardTier = getHighestUnlockedLevel(state, words);
+  const rewardItem = rollRewardItem(rewardTier, equippedStats.glory, equippedStats.luck);
+
+  state.inventory.unshift(rewardItem);
+  state.playerProgress.claimedReviewRewardDates.push(dateKey);
+  state.dailySessions[dateKey].rewardItemId = rewardItem.id;
+}
+
+function awardXp(state: AppState, baseAmount: number) {
+  const equippedStats = getEquippedStats(state);
+  gainXp(state.playerProgress, getXpAward(baseAmount, equippedStats.wisdom));
 }
 
 function refreshBatchStatuses(state: AppState) {
